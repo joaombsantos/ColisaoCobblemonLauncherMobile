@@ -1,6 +1,9 @@
 package net.kdt.pojavlaunch.fragments;
 
+import android.app.Activity;
+import android.content.Context;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.util.Log;
 import android.view.View;
 import android.widget.Button;
@@ -12,11 +15,15 @@ import androidx.fragment.app.Fragment;
 
 import com.kdt.mcgui.mcVersionSpinner;
 
+import net.kdt.pojavlaunch.Architecture;
+import net.kdt.pojavlaunch.NewJREUtil;
 import net.kdt.pojavlaunch.R;
 import net.kdt.pojavlaunch.Tools;
 import net.kdt.pojavlaunch.extra.ExtraConstants;
 import net.kdt.pojavlaunch.extra.ExtraCore;
 import net.kdt.pojavlaunch.multirt.MultiRTConfigDialog;
+import net.kdt.pojavlaunch.multirt.MultiRTUtils;
+import net.kdt.pojavlaunch.multirt.Runtime;
 import net.kdt.pojavlaunch.prefs.LauncherPreferences;
 import net.kdt.pojavlaunch.value.launcherprofiles.LauncherProfiles;
 import net.kdt.pojavlaunch.value.launcherprofiles.MinecraftProfile;
@@ -26,10 +33,17 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorCompletionService;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
@@ -37,6 +51,13 @@ public class MainMenuFragment extends Fragment {
     public static final String TAG = "MainMenuFragment";
     private static final String URL_VERSION_TXT = "https://raw.githubusercontent.com/joaombsantos/modpack_colisao_cobblemon/main/version.txt";
     private static final String URL_MODPACK_ZIP = "https://github.com/joaombsantos/modpack_colisao_cobblemon/releases/download/v1.4.1/modpack.zip";
+
+    private static final int CONNECT_TIMEOUT_MS = 15_000;
+    private static final int READ_TIMEOUT_MS = 30_000;
+    private static final long DOWNLOAD_TOTAL_TIMEOUT_MS = 30 * 60 * 1000L;
+    private static final int DOWNLOAD_MAX_ATTEMPTS = 4;
+    private static final long RETRY_DELAY_MS = 2_000L;
+    private static final int MAX_REDIRECTS = 5;
 
     private mcVersionSpinner mVersionSpinner;
 
@@ -72,47 +93,21 @@ public class MainMenuFragment extends Fragment {
     private void checkAndUpdateModpack(Button playButton) {
         playButton.setText("VERIFICANDO ATUALIZAÇÃO...");
 
+        final Context appContext = requireContext().getApplicationContext();
+        final DownloadStatus status = new DownloadStatus();
+
         new Thread(() -> {
             try {
-                File gameDir = new File(Tools.DIR_GAME_NEW);
+                runInParallel(
+                        () -> {
+                            updateModpackIfNeeded(appContext, playButton, status);
+                            return null;
+                        },
+                        () -> {
+                            installJava21IfNeeded(appContext, playButton, status);
+                            return null;
+                        });
 
-                if (!gameDir.exists()) {
-                    gameDir.mkdirs();
-                }
-
-                File localVersionFile = new File(gameDir, "modpack_version.txt");
-
-                String remoteVersion = fetchTextFromUrl(URL_VERSION_TXT).trim();
-
-                String localVersion = "";
-                if (localVersionFile.exists()) {
-                    BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(localVersionFile)));
-                    localVersion = reader.readLine();
-                    if (localVersion != null) localVersion = localVersion.trim();
-                    reader.close();
-                }
-
-                if (!remoteVersion.equals(localVersion) && !remoteVersion.isEmpty()) {
-                    requireActivity().runOnUiThread(() -> playButton.setText("BAIXANDO MODPACK..."));
-
-                    File zipFile = new File(requireContext().getCacheDir(), "modpack_temp.zip");
-                    downloadFile(URL_MODPACK_ZIP, zipFile);
-
-                    requireActivity().runOnUiThread(() -> playButton.setText("EXTRAINDO ARQUIVOS..."));
-                    unzip(zipFile, gameDir);
-
-                    FileOutputStream fos = new FileOutputStream(localVersionFile);
-                    fos.write(remoteVersion.getBytes());
-                    fos.close();
-
-                    zipFile.delete();
-                }
-
-//                requireActivity().runOnUiThread(() -> {
-//                    playButton.setText(R.string.main_play);
-//                    playButton.setEnabled(true);
-//                    launchGame();
-//                });
                 checkJavaAndLaunch(playButton);
 
             } catch (Exception e) {
@@ -129,6 +124,172 @@ public class MainMenuFragment extends Fragment {
             }
         }).start();
     }
+    private static final class DownloadStatus {
+        volatile String modpack;
+        volatile String java;
+    }
+
+    private interface ProgressListener {
+        void onProgress(int percent);
+    }
+
+    private void runOnUi(Runnable action) {
+        Activity activity = getActivity();
+        if (activity != null) {
+            activity.runOnUiThread(action);
+        }
+    }
+    private void refreshButton(Button button, DownloadStatus status) {
+        runOnUi(() -> {
+            String modpack = status.modpack;
+            String java = status.java;
+            StringBuilder text = new StringBuilder();
+            if (modpack != null) text.append(modpack);
+            if (java != null) {
+                if (text.length() > 0) text.append(" | ");
+                text.append(java);
+            }
+            button.setText(text.length() > 0 ? text.toString() : "VERIFICANDO ATUALIZAÇÃO...");
+        });
+    }
+
+    private static String percentLabel(String name, int percent) {
+        return percent >= 0 ? name + " " + percent + "%" : name + " BAIXANDO...";
+    }
+    private static void runInParallel(Callable<Void> first, Callable<Void> second) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        ExecutorCompletionService<Void> completion = new ExecutorCompletionService<>(pool);
+        Future<Void> firstFuture = completion.submit(first);
+        Future<Void> secondFuture = completion.submit(second);
+
+        boolean finished = false;
+        try {
+            completion.take().get();
+            completion.take().get();
+            finished = true;
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception) throw (Exception) cause;
+            throw e;
+        } finally {
+            if (!finished) {
+                firstFuture.cancel(true);
+                secondFuture.cancel(true);
+            }
+            pool.shutdownNow();
+        }
+    }
+    private void updateModpackIfNeeded(Context context, Button button, DownloadStatus status) throws Exception {
+        try {
+            File gameDir = new File(Tools.DIR_GAME_NEW);
+
+            if (!gameDir.exists()) {
+                gameDir.mkdirs();
+            }
+
+            File localVersionFile = new File(gameDir, "modpack_version.txt");
+
+            String remoteVersion = fetchTextFromUrl(URL_VERSION_TXT).trim();
+
+            String localVersion = "";
+            if (localVersionFile.exists()) {
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(localVersionFile)))) {
+                    localVersion = reader.readLine();
+                }
+                if (localVersion != null) localVersion = localVersion.trim();
+            }
+
+            if (!remoteVersion.equals(localVersion) && !remoteVersion.isEmpty()) {
+                File zipFile = new File(context.getCacheDir(), "modpack_temp.zip");
+                try {
+                    status.modpack = percentLabel("MODPACK", 0);
+                    refreshButton(button, status);
+
+                    downloadFile(URL_MODPACK_ZIP, zipFile, percent -> {
+                        status.modpack = percentLabel("MODPACK", percent);
+                        refreshButton(button, status);
+                    });
+
+                    status.modpack = "MODPACK EXTRAINDO...";
+                    refreshButton(button, status);
+                    unzip(zipFile, gameDir);
+
+                    try (FileOutputStream fos = new FileOutputStream(localVersionFile)) {
+                        fos.write(remoteVersion.getBytes());
+                    }
+                } finally {
+                    zipFile.delete();
+                }
+            }
+
+            status.modpack = null;
+            refreshButton(button, status);
+        } catch (Exception e) {
+            throw new Exception("Falha ao atualizar o modpack: " + e.getMessage(), e);
+        }
+    }
+    private void installJava21IfNeeded(Context context, Button button, DownloadStatus status) throws Exception {
+        if (hasJava21()) {
+            return;
+        }
+
+        final String jreName = "External-21";
+        File archive = null;
+
+        try {
+            if (Architecture.getDeviceArchitecture() == Architecture.ARCH_X86) {
+                throw new Exception("Java 21 não é suportado em dispositivos x86.");
+            }
+            if (!Tools.isOnline(context)) {
+                throw new Exception("sem conexão com a internet.");
+            }
+
+            String arch = Architecture.archAsString(Architecture.getDeviceArchitecture());
+            archive = new File(Tools.DIR_CACHE, "jre21-android-" + arch + ".tar.xz");
+
+            status.java = percentLabel("JAVA 21", 0);
+            refreshButton(button, status);
+
+            downloadFile(NewJREUtil.ExternalRuntime.JRE_21.downloadLink, archive, percent -> {
+                status.java = percentLabel("JAVA 21", percent);
+                refreshButton(button, status);
+            });
+
+            status.java = "JAVA 21 INSTALANDO...";
+            refreshButton(button, status);
+
+            try (FileInputStream in = new FileInputStream(archive)) {
+                MultiRTUtils.installRuntimeNamed(Tools.NATIVE_LIB_DIR, in, jreName);
+            }
+            MultiRTUtils.postPrepare(jreName);
+
+            if (MultiRTUtils.forceReread(jreName).javaVersion != 21) {
+                throw new Exception("o Java 21 foi extraído, mas não pôde ser lido (arquivo release inválido).");
+            }
+
+            status.java = null;
+            refreshButton(button, status);
+        } catch (Exception e) {
+            try {
+                MultiRTUtils.removeRuntimeNamed(jreName);
+            } catch (Exception ignored) {
+            }
+            throw new Exception("Falha ao instalar o Java 21: " + e.getMessage(), e);
+        } finally {
+            if (archive != null) {
+                archive.delete();
+            }
+        }
+    }
+    private boolean hasJava21() {
+        for (Runtime runtime : MultiRTUtils.getInstalledRuntimes()) {
+            if (MultiRTUtils.forceReread(runtime.name).javaVersion == 21) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void launchGame() {
         File libsDir = new File(Tools.DIR_GAME_NEW, "libraries");
         if (!libsDir.exists() || libsDir.list() == null || libsDir.list().length == 0) {
@@ -200,40 +361,137 @@ public class MainMenuFragment extends Fragment {
         connection.disconnect();
         return content.toString();
     }
-
-    private void downloadFile(String urlString, File destFile) throws Exception {
-        URL url = new URL(urlString);
-        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-        connection.setInstanceFollowRedirects(true);
-        connection.connect();
-
-        int status = connection.getResponseCode();
-        if (status == HttpURLConnection.HTTP_MOVED_TEMP ||
-                status == HttpURLConnection.HTTP_MOVED_PERM ||
-                status == HttpURLConnection.HTTP_SEE_OTHER) {
-
-            String newUrl = connection.getHeaderField("Location");
-            connection = (HttpURLConnection) new URL(newUrl).openConnection();
-            connection.connect();
+    private void downloadFile(String urlString, File destFile, ProgressListener listener) throws Exception {
+        if (destFile.exists() && !destFile.delete()) {
+            throw new Exception("Não foi possível limpar o arquivo temporário do download.");
         }
 
-        if (connection.getResponseCode() != HttpURLConnection.HTTP_OK) {
-            throw new Exception("Erro HTTP: " + connection.getResponseCode());
+        final long deadline = SystemClock.elapsedRealtime() + DOWNLOAD_TOTAL_TIMEOUT_MS;
+        IOException lastError = null;
+        boolean success = false;
+
+        try {
+            for (int attempt = 1; attempt <= DOWNLOAD_MAX_ATTEMPTS; attempt++) {
+                try {
+                    downloadAttempt(urlString, destFile, deadline, listener);
+                    success = true;
+                    return;
+                } catch (IOException e) {
+                    lastError = e;
+                    Log.w(TAG, "Download falhou (tentativa " + attempt + "/" + DOWNLOAD_MAX_ATTEMPTS + ")", e);
+                }
+
+                if (attempt < DOWNLOAD_MAX_ATTEMPTS) {
+                    long wait = Math.min(RETRY_DELAY_MS * attempt, deadline - SystemClock.elapsedRealtime());
+                    if (wait <= 0) break;
+                    Thread.sleep(wait);
+                }
+            }
+
+            String reason = lastError != null ? lastError.getMessage() : "tempo esgotado";
+            throw new Exception("Falha no download: " + reason);
+        } finally {
+            if (!success) {
+                destFile.delete();
+            }
+        }
+    }
+    private void downloadAttempt(String urlString, File destFile, long deadline, ProgressListener listener) throws Exception {
+        long existingBytes = destFile.exists() ? destFile.length() : 0;
+        HttpURLConnection connection = openWithRedirects(urlString, existingBytes);
+
+        try {
+            int status = connection.getResponseCode();
+            boolean append;
+
+            if (status == HttpURLConnection.HTTP_PARTIAL) {
+                append = true;
+            } else if (status == HttpURLConnection.HTTP_OK) {
+                append = false;
+                existingBytes = 0;
+            } else if (status == 416) {
+                destFile.delete();
+                throw new IOException("Servidor recusou retomar o download (HTTP 416)");
+            } else if (status >= 500 || status == 408 || status == 429) {
+                throw new IOException("Erro HTTP temporário: " + status);
+            } else {
+                throw new Exception("Erro HTTP: " + status);
+            }
+
+            long remaining = connection.getContentLengthLong();
+            long expectedTotal = remaining >= 0 ? existingBytes + remaining : -1;
+            long written = existingBytes;
+            int lastPercent = reportProgress(listener, written, expectedTotal, -2);
+
+            try (InputStream input = new BufferedInputStream(connection.getInputStream(), 8192);
+                 FileOutputStream output = new FileOutputStream(destFile, append)) {
+
+                byte[] data = new byte[8192];
+                int count;
+                while ((count = input.read(data)) != -1) {
+                    if (Thread.currentThread().isInterrupted()) {
+                        throw new InterruptedException("Download cancelado");
+                    }
+                    if (SystemClock.elapsedRealtime() > deadline) {
+                        throw new Exception("Tempo limite do download excedido");
+                    }
+                    output.write(data, 0, count);
+                    written += count;
+                    lastPercent = reportProgress(listener, written, expectedTotal, lastPercent);
+                }
+                output.flush();
+            }
+
+            if (expectedTotal >= 0 && written != expectedTotal) {
+                throw new IOException("Download incompleto: " + written + " de " + expectedTotal + " bytes");
+            }
+        } finally {
+            connection.disconnect();
+        }
+    }
+    private static int reportProgress(ProgressListener listener, long done, long total, int lastPercent) {
+        if (listener == null) return lastPercent;
+        int percent = total > 0 ? (int) Math.min(100L, done * 100L / total) : -1;
+        if (percent != lastPercent) {
+            listener.onProgress(percent);
+        }
+        return percent;
+    }
+    private HttpURLConnection openWithRedirects(String urlString, long resumeFrom) throws IOException {
+        String current = urlString;
+
+        for (int hop = 0; hop <= MAX_REDIRECTS; hop++) {
+            HttpURLConnection connection = (HttpURLConnection) new URL(current).openConnection();
+            connection.setInstanceFollowRedirects(false);
+            connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
+            connection.setReadTimeout(READ_TIMEOUT_MS);
+            connection.setRequestProperty("Accept-Encoding", "identity");
+            if (resumeFrom > 0) {
+                connection.setRequestProperty("Range", "bytes=" + resumeFrom + "-");
+            }
+
+            try {
+                int status = connection.getResponseCode();
+                if (status == HttpURLConnection.HTTP_MOVED_PERM
+                        || status == HttpURLConnection.HTTP_MOVED_TEMP
+                        || status == HttpURLConnection.HTTP_SEE_OTHER
+                        || status == 307 || status == 308) {
+                    String location = connection.getHeaderField("Location");
+                    connection.disconnect();
+                    if (location == null) {
+                        throw new IOException("Redirecionamento sem destino (HTTP " + status + ")");
+                    }
+                    current = new URL(new URL(current), location).toString();
+                    continue;
+                }
+                return connection;
+            } catch (IOException e) {
+                connection.disconnect();
+                throw e;
+            }
         }
 
-        InputStream input = new BufferedInputStream(connection.getInputStream(), 8192);
-        FileOutputStream output = new FileOutputStream(destFile);
-
-        byte[] data = new byte[1024];
-        int count;
-        while ((count = input.read(data)) != -1) {
-            output.write(data, 0, count);
-        }
-
-        output.flush();
-        output.close();
-        input.close();
-        connection.disconnect();
+        throw new IOException("Redirecionamentos demais");
     }
 
     private void unzip(File zipFile, File targetDirectory) throws Exception {
@@ -322,19 +580,9 @@ public class MainMenuFragment extends Fragment {
     }
 
     private void checkJavaAndLaunch(Button playButton) {
-        File runtimesDir = new File(Tools.DIR_DATA, "runtimes");
-        boolean hasJava21 = false;
+        boolean javaOk = hasJava21();
 
-        if (runtimesDir.exists() && runtimesDir.listFiles() != null) {
-            for (File file : runtimesDir.listFiles()) {
-                if (file.isDirectory() && (file.getName().contains("21") || file.getName().contains("jre21") || file.getName().contains("internal-java-21"))) {
-                    hasJava21 = true;
-                    break;
-                }
-            }
-        }
-
-        if (!hasJava21) {
+        if (!javaOk) {
             requireActivity().runOnUiThread(() -> {
                 playButton.setText(R.string.main_play);
                 playButton.setEnabled(true);
