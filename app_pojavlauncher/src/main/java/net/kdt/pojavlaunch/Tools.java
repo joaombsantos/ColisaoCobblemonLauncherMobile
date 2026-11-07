@@ -114,22 +114,22 @@ import java.util.Map;
 public final class Tools {
     public  static final float BYTE_TO_MB = 1024 * 1024;
     public static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
-    public static String APP_NAME = "Amethyst";
+    public static String APP_NAME = "Colisao Cobblemon";
 
     public static final Gson GLOBAL_GSON = new GsonBuilder().setPrettyPrinting().create();
 
-    public static final String URL_HOME = "https://wiki.angelauramc.dev";
+    public static final String URL_HOME = "https://www.colisaocobblemon.com.br/";
     public static String NATIVE_LIB_DIR;
     public static String DIR_DATA; //Initialized later to get context
     public static File DIR_CACHE;
     public static String MULTIRT_HOME;
     public static String LOCAL_RENDERER = null;
     public static int DEVICE_ARCHITECTURE;
-    public static final String LAUNCHERPROFILES_RTPREFIX = "amethyst://";
+    public static final String LAUNCHERPROFILES_RTPREFIX = "colisaocobblemon://";
 
     // New since 3.3.1
     public static String DIR_ACCOUNT_NEW;
-    public static String DIR_GAME_HOME = Environment.getExternalStorageDirectory().getAbsolutePath() + "/games/Amethyst";
+    public static String DIR_GAME_HOME = Environment.getExternalStorageDirectory().getAbsolutePath() + "/games/ColisaoCobblemon";
     public static String DIR_GAME_NEW;
     public static String GAME_PROFILES_FILE;
 
@@ -158,7 +158,7 @@ public final class Tools {
         if(SDK_INT >= 29) {
             return ctx.getExternalFilesDir(null);
         }else{
-            return new File(Environment.getExternalStorageDirectory(),"games/Amethyst");
+            return new File(Environment.getExternalStorageDirectory(),"games/ColisaoCobblemon");
         }
     }
 
@@ -637,14 +637,14 @@ public final class Tools {
             Log.i(TAG, "Legacy4J detected!");
             oldL4JMitigationLogListener = loggedLine -> {
                 if (loggedLine.contains("literal{SDL3 (isXander's libsdl4j)} isn't supported in this system. GLFW will be used instead.")) {
-                    Logger.appendToLog("Amethyst-Android: Broken version of Legacy4J (below 1.8.51.8.5.2537.1) detected! Force enabling SDL");
+                    Logger.appendToLog("ColisaoCobblemon-Android: Broken version of Legacy4J (below 1.8.51.8.5.2537.1) detected! Force enabling SDL");
                     Tools.SDL.initializeControllerSubsystems();
                     Tools.runOnUiThread(() -> {
                         Tools.dialog(activity, activity.getString(R.string.global_warning), activity.getString(R.string.oldL4JFound));
                     });
                     Logger.removeLogListener(oldL4JMitigationLogListener);
                 } else if (loggedLine.contains("Added SDL Controller Mappings")) {
-                    Logger.appendToLog("Amethyst-Android: Fixed version of Legacy4J (1.8.5.2537.1 or higher) detected! Have fun!");
+                    Logger.appendToLog("ColisaoCobblemon-Android: Fixed version of Legacy4J (1.8.5.2537.1 or higher) detected! Have fun!");
                     Logger.removeLogListener(oldL4JMitigationLogListener);
                 }
             };
